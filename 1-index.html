@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>THE GLASS TIDE</title>
+<meta name="description" content="Walk the strand. Hide from the light. Witness what the tide brings in.">
+<style>
+  html, body { margin:0; padding:0; background:#0d0f0e; height:100%; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  #fallback { color:#e9e5da; font-family:ui-monospace,monospace; padding:2rem; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* THE GLASS TIDE - a strand-side game of giant translucent things.
+   Walk right. When a creature's inner light rises, crouch in cover
+   before its gaze sweeps the shore. Survive. Witness. */
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- palette ---------- */
+const PAL = {
+  skyTop: '#66727a', skyHor: '#aeb7ba',
+  seaFar: '#8d999d', seaNear: '#4d585c',
+  sandFar: '#3f4340', sandNear: '#101211',
+  ink: '#0c0e0d',
+  bone: '#e9e5da',
+  moon: '#efe9d8',
+  glow: '#fff3d9'
+};
+
+/* ---------- world ---------- */
+const PX_PER_M = 55;
+const horizonY = () => H * 0.44;
+const waterY   = () => H * 0.60;
+const groundY  = () => H * 0.80;
+
+let state = 'title';          // title | play | dead
+let time = 0;                 // seconds, play-time
+let playerX = 0;              // world px
+let camX = 0;
+let dread = 0;                // 0..1
+let bestM = parseInt(localStorage.getItem('glasstide_best') || '0', 10);
+let witnessedRun = 0, witnessedTotal = parseInt(localStorage.getItem('glasstide_wit') || '0', 10);
+let deadMsg = '';
+let fadeWhite = 0;
+
+/* input */
+const keys = {};
+let touchMove = 0, touchCrouch = false;
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  initAudio();
+  if (state === 'title') startRun();
+  else if (state === 'dead' && deadAge > 1.2) startRun();
+  if (['arrowleft','arrowright','arrowdown','arrowup',' '].includes(e.key.toLowerCase())) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener('pointerdown', e => {
+  initAudio();
+  if (state === 'title') { startRun(); return; }
+  if (state === 'dead' && deadAge > 1.2) { startRun(); return; }
+  handlePointer(e, true);
+});
+canvas.addEventListener('pointermove', e => handlePointer(e, true));
+canvas.addEventListener('pointerup',   () => { touchMove = 0; touchCrouch = false; });
+canvas.addEventListener('pointercancel', () => { touchMove = 0; touchCrouch = false; });
+function handlePointer(e, down) {
+  if (!down) return;
+  const y = e.clientY;
+  if (y > H * 0.72 && e.clientX > W * 0.33 && e.clientX < W * 0.67) { touchCrouch = true; touchMove = 0; return; }
+  touchCrouch = false;
+  touchMove = e.clientX > W / 2 ? 1 : -1;
+}
+
+/* ---------- cover zones ---------- */
+/* Deterministic strand: rocks & grass patches spaced along the walk. */
+function rand01(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+const COVER_GAP_MIN = 750, COVER_GAP_MAX = 1500;
+function coverZones(fromX, toX) {
+  const out = [];
+  let i = Math.floor(fromX / 900) - 1;
+  while (true) {
+    const x = i * 900 + 300 + rand01(i) * 900;
+    if (x > toX) break;
+    if (x > fromX && i >= 0) {
+      const kind = rand01(i * 7.3) < 0.45 ? 'rock' : 'grass';
+      out.push({ x, w: kind === 'rock' ? 150 + rand01(i * 3.1) * 90 : 200 + rand01(i * 5.7) * 120, kind, seed: i });
+    }
+    i++;
+  }
+  return out;
+}
+
+/* ---------- creatures ---------- */
+const creatures = [];
+let nextSpawnM = 140;
+let creatureSeq = 0;
+
+const CTYPES = ['prawn', 'isopod', 'serpent'];
+
+function spawnCreature() {
+  const type = CTYPES[creatureSeq % CTYPES.length];
+  creatureSeq++;
+  const ahead = camX + W + 400 + Math.random() * 600;
+  const scale = type === 'serpent' ? 3.1 : type === 'prawn' ? 3.2 : 2.6;
+  creatures.push({
+    type, seed: Math.random() * 1000,
+    x: ahead, y: 0, rise: 0,           // rise 0..1 emergence
+    scale,
+    state: 'approach',                  // approach -> rise -> active -> leave
+    cycle: 4 + Math.random() * 4,       // countdown to warn
+    phase: 'calm', phaseT: 0,           // calm | warn | gaze | rest
+    glow: 0,                            // 0..1 light intensity
+    sweep: 0,                           // gaze sweep position 0..1
+    witnessed: false,
+    drift: (Math.random() * 0.4 + 0.25) * (Math.random() < 0.5 ? 1 : 1) , // slow leftward drift in world px/s
+    len: (type === 'serpent' ? 620 : type === 'prawn' ? 480 : 340) * scale,
+    segs: type === 'serpent' ? 26 : type === 'prawn' ? 16 : 13
+  });
+}
+
+function updateCreatures(dt) {
+  const meters = playerX / PX_PER_M;
+  if (meters > nextSpawnM - 60 && creatures.filter(c => c.state !== 'leave').length < (meters > 900 ? 3 : meters > 350 ? 2 : 1)) {
+    spawnCreature();
+    nextSpawnM += 260 + Math.random() * 260 - Math.min(meters * 0.05, 120);
+  }
+  for (const c of creatures) {
+    c.phaseT += dt;
+    if (c.state === 'approach') {
+      c.x -= c.drift * 30 * dt;
+      if (c.x < camX + W * 0.75) c.state = 'rise';
+    } else if (c.state === 'rise') {
+      c.rise = Math.min(1, c.rise + dt * 0.25);
+      if (c.rise >= 1) { c.state = 'active'; droneOn(c); }
+    } else if (c.state === 'active') {
+      c.x -= c.drift * 8 * dt;
+      // glow cycle
+      if (c.phase === 'calm') {
+        c.glow = Math.max(0, c.glow - dt * 0.6);
+        c.cycle -= dt;
+        if (c.cycle <= 0) { c.phase = 'warn'; c.phaseT = 0; chimeWarn(); }
+      } else if (c.phase === 'warn') {
+        c.glow = Math.min(0.45, c.glow + dt * 0.5);
+        if (c.phaseT > 2.2) { c.phase = 'gaze'; c.phaseT = 0; c.sweep = 0; gazeOn(); }
+      } else if (c.phase === 'gaze') {
+        c.glow = Math.min(1, c.glow + dt * 2.2);
+        c.sweep = Math.min(1, c.phaseT / 2.6);
+        // the light searches the shore
+        if (c.sweep > 0.08 && c.sweep < 0.95) {
+          if (!playerHidden()) dread += dt * 0.4;
+          else if (!c.witnessed) { c.witnessed = true; witnessBell(); }
+        }
+        if (c.phaseT > 3.2) { c.phase = 'rest'; c.phaseT = 0; }
+      } else if (c.phase === 'rest') {
+        c.glow = Math.max(0, c.glow - dt * 1.4);
+        if (c.phaseT > 1.2) { c.phase = 'calm'; c.phaseT = 0; c.cycle = Math.max(2.2, 7 - meters * 0.004) + Math.random() * 3; }
+      }
+      // left behind -> leave
+      if (c.x + c.len < camX - 300) {
+        c.state = 'leave';
+        if (c.witnessed) { witnessedRun++; witnessedTotal++; localStorage.setItem('glasstide_wit', String(witnessedTotal)); }
+      }
+    } else if (c.state === 'leave') {
+      c.rise = Math.max(0, c.rise - dt * 0.3);
+      c.glow = Math.max(0, c.glow - dt);
+      if (c.rise <= 0) c.dead = true;
+    }
+  }
+  for (let i = creatures.length - 1; i >= 0; i--) if (creatures[i].dead) creatures.splice(i, 1);
+}
+
+/* ---------- player ---------- */
+let crouch = false, walkPhase = 0, facing = 1;
+let hidden = false;
+
+function playerHidden() { return hidden; }
+
+function updatePlayer(dt) {
+  const left = keys['a'] || keys['arrowleft'] || touchMove < 0;
+  const right = keys['d'] || keys['arrowright'] || touchMove > 0;
+  crouch = !!(keys['s'] || keys['arrowdown'] || touchCrouch);
+  let v = 0;
+  if (left) { v -= 1; facing = -1; }
+  if (right) { v += 1; facing = 1; }
+  const speed = crouch ? 55 : 175;
+  playerX = Math.max(0, playerX + v * speed * dt);
+  if (v !== 0) walkPhase += dt * (crouch ? 5 : 9);
+  camX = playerX - W * 0.32;
+
+  // hidden = crouched inside a cover zone
+  hidden = false;
+  if (crouch) {
+    for (const z of coverZones(camX - 600, camX + W + 600)) {
+      if (Math.abs(playerX - z.x) < z.w * 0.5) { hidden = true; break; }
+    }
+  }
+}
+
+/* ---------- audio ---------- */
+let AC = null, muted = false, surfGain = null, droneOsc = null, droneGain = null;
+function initAudio() {
+  if (AC) return;
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  const master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination);
+  // surf: looped noise, low-passed, slow LFO swells
+  const len = AC.sampleRate * 4;
+  const buf = AC.createBuffer(1, len, AC.sampleRate);
+  const d = buf.getChannelData(0);
+  let lp = 0;
+  for (let i = 0; i < len; i++) { lp = lp * 0.94 + (Math.random() * 2 - 1) * 0.06; d[i] = lp * 6; }
+  const src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+  const filt = AC.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 480;
+  surfGain = AC.createGain(); surfGain.gain.value = 0.35;
+  src.connect(filt); filt.connect(surfGain); surfGain.connect(master); src.start();
+  window._master = master;
+  // slow swell
+  setInterval(() => {
+    if (!AC || muted) return;
+    const t = AC.currentTime;
+    surfGain.gain.cancelScheduledValues(t);
+    surfGain.gain.setTargetAtTime(0.22 + Math.random() * 0.25, t, 1.8);
+  }, 3200);
+}
+function tone(freq, dur, gain, type, when) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + (when || 0);
+  const o = AC.createOscillator(); o.type = type || 'sine'; o.frequency.value = freq;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.05);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(window._master);
+  o.start(t); o.stop(t + dur + 0.1);
+}
+function chimeWarn() { tone(740, 0.7, 0.05); tone(1108, 0.9, 0.03, 'sine', 0.12); }
+function gazeOn()    { tone(1244, 1.8, 0.025); tone(1480, 1.8, 0.018, 'sine', 0.05); }
+function witnessBell(){ tone(660, 1.4, 0.06); tone(990, 1.8, 0.04, 'sine', 0.08); }
+function caughtThud() {
+  if (!AC || muted) return;
+  const t = AC.currentTime;
+  const o = AC.createOscillator(); o.type = 'sine';
+  o.frequency.setValueAtTime(90, t); o.frequency.exponentialRampToValueAtTime(38, t + 0.9);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.4, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
+  o.connect(g); g.connect(window._master); o.start(t); o.stop(t + 1.3);
+}
+function droneOn(c) {
+  if (!AC || muted) return;
+  tone(55, 4, 0.09, 'sine'); tone(55.7, 4, 0.07, 'sine', 0.1);
+}
+window.addEventListener('keydown', e => { if (e.key.toLowerCase() === 'm') muted = !muted; });
+
+/* ---------- run control ---------- */
+function startRun() {
+  state = 'play'; time = 0; playerX = 0; camX = -W * 0.32; dread = 0;
+  creatures.length = 0; nextSpawnM = 140; creatureSeq = 0; witnessedRun = 0; fadeWhite = 0;
+}
+let deadAge = 0;
+function die() {
+  state = 'dead'; deadAge = 0;
+  const m = Math.floor(playerX / PX_PER_M);
+  if (m > bestM) { bestM = m; localStorage.setItem('glasstide_best', String(bestM)); }
+  deadMsg = ['the light found you', 'the tide keeps what it sees', 'it shelved you with the others'][Math.floor(Math.random() * 3)];
+  caughtThud();
+}
+
+/* ---------- drawing helpers ---------- */
+function xr(wx) { return wx - camX; }   // world -> screen x
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, horizonY() + 2);
+  g.addColorStop(0, PAL.skyTop); g.addColorStop(1, PAL.skyHor);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, horizonY() + 2);
+  // moon
+  const mx = W * 0.62, my = H * 0.12;
+  const mg = ctx.createRadialGradient(mx, my, 2, mx, my, 90);
+  mg.addColorStop(0, 'rgba(239,233,216,0.9)'); mg.addColorStop(0.25, 'rgba(239,233,216,0.35)'); mg.addColorStop(1, 'rgba(239,233,216,0)');
+  ctx.fillStyle = mg; ctx.fillRect(mx - 100, my - 100, 200, 200);
+  ctx.fillStyle = PAL.moon;
+  ctx.beginPath(); ctx.arc(mx, my, 13, 0, Math.PI * 2); ctx.fill();
+  // faint stars
+  ctx.fillStyle = 'rgba(240,240,235,0.5)';
+  for (let i = 0; i < 26; i++) {
+    const sx = (rand01(i * 3.7) * W), sy = rand01(i * 9.1) * H * 0.3;
+    const tw = 0.25 + 0.35 * Math.sin(time * 0.7 + i);
+    ctx.globalAlpha = Math.max(0.06, tw);
+    ctx.fillRect(sx, sy, 1.4, 1.4);
+  }
+  ctx.globalAlpha = 1;
+  // distant headland
+  ctx.fillStyle = 'rgba(74,84,87,0.4)';
+  ctx.beginPath();
+  ctx.moveTo(-50, horizonY());
+  const off = camX * 0.05;
+  for (let x = -50; x <= W + 50; x += 30) {
+    const wx = x + off;
+    ctx.lineTo(x, horizonY() - 3 - Math.max(0, Math.sin(wx * 0.0011 + 1.3)) * (4 + rand01(Math.floor(wx / 1600) + 2) * 12) - Math.sin(wx * 0.006) * 3);
+  }
+  ctx.lineTo(W + 50, horizonY()); ctx.closePath(); ctx.fill();
+}
+
+function drawSea() {
+  const g = ctx.createLinearGradient(0, horizonY(), 0, waterY() + 30);
+  g.addColorStop(0, PAL.seaFar); g.addColorStop(1, PAL.seaNear);
+  ctx.fillStyle = g; ctx.fillRect(0, horizonY(), W, waterY() + 30 - horizonY());
+  // rolling wave bands
+  for (let b = 0; b < 7; b++) {
+    const yb = horizonY() + 8 + b * (waterY() - horizonY()) / 6;
+    const amp = 2 + b * 1.6, per = 140 + b * 60, spd = 0.6 + b * 0.25;
+    ctx.strokeStyle = 'rgba(235,240,240,' + (0.10 + b * 0.03) + ')';
+    ctx.lineWidth = 1 + b * 0.5;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 8) {
+      const wx = x + camX * 0.3;
+      const y = yb + Math.sin(wx / per * Math.PI * 2 + time * spd) * amp + Math.sin(wx / (per * 0.37) + time * spd * 1.7) * amp * 0.4;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  // foam at waterline
+  ctx.strokeStyle = 'rgba(240,244,244,0.5)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 6) {
+    const wx = x + camX * 0.55;
+    const y = waterY() + Math.sin(wx * 0.008 + time * 1.1) * 5 + Math.sin(wx * 0.021 - time * 0.7) * 3;
+    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawSand() {
+  const g = ctx.createLinearGradient(0, waterY(), 0, H);
+  g.addColorStop(0, PAL.sandFar); g.addColorStop(0.45, '#22241f'); g.addColorStop(1, PAL.sandNear);
+  ctx.fillStyle = g; ctx.fillRect(0, waterY(), W, H - waterY());
+  // wet sheen band
+  ctx.fillStyle = 'rgba(200,210,210,0.06)';
+  ctx.fillRect(0, waterY(), W, 26);
+}
+
+/* ----- creature rendering ----- */
+function spinePoints(c) {
+  const pts = [];
+  const n = c.segs;
+  const baseY = c.type === 'isopod' ? waterY() - 6 * c.scale : horizonY() + (waterY() - horizonY()) * 0.45 - 26 * c.scale;
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    let x = c.x + t * c.len;
+    let y;
+    const sway = Math.sin(time * 0.9 + c.seed + t * 5.2) * (6 + 14 * t) * c.scale;
+    if (c.type === 'prawn') {
+      y = baseY + Math.sin(t * Math.PI) * -60 * c.scale + t * 30 * c.scale + sway;
+    } else if (c.type === 'isopod') {
+      y = baseY + 34 * c.scale + Math.sin(t * Math.PI) * -14 * c.scale + sway * 0.3;
+    } else { // serpent: rises, tail curls up
+      y = baseY + 30 * c.scale - Math.sin(t * Math.PI * 0.9) * 130 * c.scale + sway;
+      x -= Math.sin(t * Math.PI) * 120 * c.scale;
+    }
+    pts.push({ x, y, t });
+  }
+  return pts;
+}
+
+function drawCreature(c) {
+  const pts = spinePoints(c);
+  const alpha = 0.20 + c.glow * 0.26;
+  ctx.save();
+  ctx.globalAlpha = c.rise;
+
+  // glow behind body
+  if (c.glow > 0.02) {
+    const gi = pts[Math.floor(pts.length * 0.55)];
+    const gx = xr(gi.x), gy = gi.y;
+    const r = 260 * c.scale * (0.5 + c.glow);
+    const gg = ctx.createRadialGradient(gx, gy, 4, gx, gy, r);
+    gg.addColorStop(0, 'rgba(255,243,217,' + (0.5 * c.glow) + ')');
+    gg.addColorStop(1, 'rgba(255,243,217,0)');
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = gg;
+    ctx.fillRect(gx - r, gy - r, r * 2, r * 2);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // body: overlapping glass plates along the spine
+  function prof(t) {
+    if (c.type === 'isopod') return Math.pow(Math.max(0.06, Math.sin(Math.PI * (t * 0.94 + 0.03))), 0.6);
+    if (c.type === 'prawn') return Math.pow(Math.max(0.05, Math.sin(Math.PI * (t * 0.82 + 0.10))), 0.8);
+    return Math.pow(Math.max(0.08, Math.sin(Math.PI * (t * 0.88 + 0.06))), 0.75);
+  }
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    const x = xr(p.x);
+    if (x < -260 || x > W + 260) continue;
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[Math.min(pts.length - 1, i + 1)];
+    const ang = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+    const base = c.type === 'isopod' ? 46 : c.type === 'prawn' ? 52 : 44;
+    const rw = Math.max(5, base * c.scale * prof(p.t));
+    const rh = rw * (c.type === 'isopod' ? 0.5 : 0.66);
+    ctx.save();
+    ctx.translate(x, p.y);
+    ctx.rotate(ang);
+    const gr = ctx.createRadialGradient(-rw * 0.25, -rh * 0.4, 1, 0, 0, rw);
+    gr.addColorStop(0, 'rgba(255,255,255,' + (alpha * 0.55 + c.glow * 0.28) + ')');
+    gr.addColorStop(0.55, 'rgba(214,228,233,' + alpha + ')');
+    gr.addColorStop(1, 'rgba(160,180,188,' + (alpha * 0.45) + ')');
+    ctx.fillStyle = gr;
+    ctx.beginPath(); ctx.ellipse(0, 0, rw, rh, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(245,250,250,' + (0.15 + c.glow * 0.28) + ')';
+    ctx.lineWidth = 1.1;
+    ctx.stroke();
+    // plate seam
+    ctx.strokeStyle = 'rgba(120,140,146,0.4)';
+    ctx.beginPath(); ctx.ellipse(rw * 0.5, 0, rw * 0.3, rh * 0.9, 0, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+    ctx.restore();
+    // legs
+    if (i > 1 && i < pts.length - 2) {
+      const legA = Math.sin(time * 3 + c.seed + i * 0.8) * 0.25;
+      ctx.strokeStyle = 'rgba(208,222,226,' + (alpha * 0.7) + ')';
+      ctx.lineWidth = 1.1;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(x, p.y + rh * 0.6);
+        ctx.lineTo(x + sd * (9 + legA * 10) * c.scale, p.y + rh + (20 + legA * 7) * c.scale);
+        ctx.stroke();
+      }
+    }
+    // dorsal plates for serpent
+    if (c.type === 'serpent' && i % 2 === 0) {
+      ctx.fillStyle = 'rgba(228,238,240,' + (alpha * 0.45) + ')';
+      ctx.beginPath();
+      ctx.moveTo(x - 6 * c.scale, p.y - rh * 0.75);
+      ctx.lineTo(x, p.y - rh * 0.75 - 16 * c.scale * prof(p.t));
+      ctx.lineTo(x + 6 * c.scale, p.y - rh * 0.75);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  // tail fan for prawn
+  if (c.type === 'prawn') {
+    const tp = pts[pts.length - 1];
+    const tx = xr(tp.x), ty = tp.y;
+    ctx.strokeStyle = 'rgba(225,236,240,' + (alpha * 0.8) + ')';
+    ctx.lineWidth = 1.1;
+    for (const a of [-0.5, -0.2, 0.2, 0.5]) {
+      ctx.beginPath();
+      ctx.moveTo(tx, ty);
+      ctx.quadraticCurveTo(tx + 26 * c.scale, ty + a * 34 * c.scale, tx + 48 * c.scale, ty + a * 60 * c.scale);
+      ctx.stroke();
+    }
+  }
+
+  // head: antennae
+  const h = pts[0];
+  const hx = xr(h.x), hy = h.y;
+  const quiver = c.phase === 'warn' ? Math.sin(time * 26) * 6 : Math.sin(time * 1.4 + c.seed) * 3;
+  ctx.strokeStyle = 'rgba(225,235,238,' + (0.16 + c.glow * 0.22) + ')';
+  ctx.lineWidth = 1.2;
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(hx, hy - 8 * c.scale);
+    ctx.quadraticCurveTo(
+      hx - 110 * c.scale, hy - (95 + s * 22) * c.scale + quiver,
+      hx - (210 + s * 45) * c.scale, hy - (40 - s * 45) * c.scale + quiver * 2
+    );
+    ctx.stroke();
+  }
+  // eye
+  ctx.fillStyle = 'rgba(20,26,28,' + (0.5 + c.glow * 0.2) + ')';
+  ctx.beginPath(); ctx.arc(hx - 6 * c.scale, hy - 6 * c.scale, 1.9 * c.scale, 0, Math.PI * 2); ctx.fill();
+
+  // gaze cone sweeping the shore
+  if (c.phase === 'gaze') {
+    const gi = pts[Math.floor(pts.length * 0.5)];
+    const gx = xr(gi.x), gy = gi.y;
+    const sweepX = camX + W * (1 - c.sweep * 1.1);
+    ctx.globalCompositeOperation = 'lighter';
+    const cg = ctx.createLinearGradient(gx, gy, sweepX, groundY());
+    cg.addColorStop(0, 'rgba(255,243,217,' + (0.15 * c.glow) + ')');
+    cg.addColorStop(1, 'rgba(255,243,217,0.02)');
+    ctx.fillStyle = cg;
+    ctx.beginPath();
+    ctx.moveTo(gx, gy);
+    ctx.lineTo(sweepX - 200, groundY() + 40);
+    ctx.lineTo(sweepX + 200, groundY() + 40);
+    ctx.closePath(); ctx.fill();
+    // hotspot on the sand
+    const hg = ctx.createRadialGradient(sweepX, groundY(), 2, sweepX, groundY(), 120);
+    hg.addColorStop(0, 'rgba(255,243,217,' + (0.35 * c.glow) + ')');
+    hg.addColorStop(1, 'rgba(255,243,217,0)');
+    ctx.fillStyle = hg;
+    ctx.fillRect(sweepX - 120, groundY() - 60, 240, 130);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
+}
+
+/* ----- cover ----- */
+function drawCover(z) {
+  const x = xr(z.x);
+  if (x < -300 || x > W + 300) return;
+  const gy = groundY();
+  // warn hint: nearby cover breathes a faint outline when a creature warns
+  let hint = 0;
+  for (const c of creatures) if ((c.phase === 'warn' || c.phase === 'gaze') && Math.abs(c.x - z.x) < 2200) hint = 0.25 + 0.15 * Math.sin(time * 6);
+  ctx.save();
+  if (z.kind === 'rock') {
+    ctx.fillStyle = PAL.ink;
+    ctx.beginPath();
+    ctx.moveTo(x - z.w * 0.5, gy + 6);
+    const bumps = 5;
+    for (let i = 0; i <= bumps; i++) {
+      const bx = x - z.w * 0.5 + (i / bumps) * z.w;
+      const by = gy + 6 - (26 + rand01(z.seed * 13 + i) * 46) * (i === 0 || i === bumps ? 0.15 : 1);
+      ctx.lineTo(bx, by);
+    }
+    ctx.lineTo(x + z.w * 0.5, gy + 6);
+    ctx.closePath(); ctx.fill();
+    if (hint > 0) { ctx.strokeStyle = 'rgba(233,229,218,' + hint + ')'; ctx.lineWidth = 1.5; ctx.stroke(); }
+  } else {
+    // grass tufts
+    ctx.strokeStyle = PAL.ink;
+    const blades = Math.floor(z.w / 14);
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < blades; i++) {
+      const bx = x - z.w * 0.5 + (i / blades) * z.w;
+      const bh = 30 + rand01(z.seed * 7 + i * 2.3) * 55;
+      const sway = Math.sin(time * 1.8 + i * 0.9 + z.seed) * 8;
+      ctx.moveTo(bx, gy + 6);
+      ctx.quadraticCurveTo(bx + sway * 0.4, gy - bh * 0.6, bx + sway, gy - bh);
+    }
+    ctx.stroke();
+    if (hint > 0) { ctx.strokeStyle = 'rgba(233,229,218,' + hint + ')'; ctx.lineWidth = 1; ctx.stroke(); }
+  }
+  ctx.restore();
+}
+
+/* ----- player ----- */
+function drawPlayer() {
+  const x = xr(playerX), gy = groundY();
+  const hgt = crouch ? 34 : 62;
+  ctx.save();
+  ctx.translate(x, gy);
+  ctx.scale(facing, 1);
+  ctx.fillStyle = PAL.ink;
+  // legs
+  const lp = crouch ? 0 : Math.sin(walkPhase) * 8;
+  ctx.strokeStyle = PAL.ink; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -hgt * 0.45);
+  ctx.lineTo(lp, 0);
+  ctx.moveTo(0, -hgt * 0.45);
+  ctx.lineTo(-lp, 0);
+  ctx.stroke();
+  // coat / body (hooded figure)
+  ctx.beginPath();
+  ctx.moveTo(-7, -hgt * 0.42);
+  ctx.quadraticCurveTo(-9, -hgt * 0.95, 0, -hgt);
+  ctx.quadraticCurveTo(9, -hgt * 0.95, 7, -hgt * 0.42);
+  ctx.closePath(); ctx.fill();
+  // head
+  ctx.beginPath(); ctx.arc(1, -hgt - 5, 5.4, 0, Math.PI * 2); ctx.fill();
+  // rim light when a gaze is live and player exposed
+  let danger = 0;
+  for (const c of creatures) if (c.phase === 'gaze') danger = Math.max(danger, c.glow);
+  if (danger > 0 && !hidden) {
+    ctx.strokeStyle = 'rgba(255,243,217,' + (0.5 * danger) + ')';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(1, -hgt - 5, 7.4, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+
+  // hidden state whisper
+  if (crouch) {
+    ctx.fillStyle = hidden ? 'rgba(233,229,218,0.75)' : 'rgba(233,229,218,0.3)';
+    ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(hidden ? 'hidden' : 'exposed', x, gy + 26);
+  }
+}
+
+/* ----- atmosphere ----- */
+function drawFog() {
+  ctx.save();
+  for (let i = 0; i < 5; i++) {
+    const fx = ((i * 700 + time * (12 + i * 6)) % (W + 900)) - 450;
+    const fy = H * (0.3 + i * 0.12);
+    const fr = 320 + i * 90;
+    const fg = ctx.createRadialGradient(fx, fy, 10, fx, fy, fr);
+    fg.addColorStop(0, 'rgba(200,208,210,0.05)');
+    fg.addColorStop(1, 'rgba(200,208,210,0)');
+    ctx.fillStyle = fg;
+    ctx.fillRect(fx - fr, fy - fr, fr * 2, fr * 2);
+  }
+  // vignette
+  const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  vg.addColorStop(0, 'rgba(10,12,11,0)');
+  vg.addColorStop(1, 'rgba(10,12,11,0.5)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function drawDread() {
+  if (dread <= 0.01) return;
+  ctx.save();
+  const a = Math.min(1, dread);
+  const fg = ctx.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.85);
+  fg.addColorStop(0, 'rgba(240,244,244,0)');
+  fg.addColorStop(1, 'rgba(240,244,244,' + (a * 0.55) + ')');
+  ctx.fillStyle = fg; ctx.fillRect(0, 0, W, H);
+  // crystalline edge ticks
+  ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.6) + ')';
+  ctx.lineWidth = 1;
+  const n = Math.floor(a * 40);
+  for (let i = 0; i < n; i++) {
+    const ex = rand01(i * 1.7) * W, ey = rand01(i * 3.3) * H;
+    const edge = Math.min(ex, W - ex, ey, H - ey);
+    if (edge < 60) {
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex + (rand01(i * 9) - 0.5) * 30, ey + (rand01(i * 4) - 0.5) * 30);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/* ----- UI ----- */
+function smallCaps(txt, x, y, size, alpha, align) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.fillStyle = PAL.bone;
+  ctx.font = '300 ' + size + 'px "Helvetica Neue", Helvetica, Arial, sans-serif';
+  ctx.textAlign = align || 'center';
+  const sp = size * 0.34;
+  let cx = x;
+  const widths = [];
+  let total = 0;
+  for (const ch of txt) { const w = ctx.measureText(ch).width + sp; widths.push(w); total += w; }
+  if ((align || 'center') === 'center') cx = x - total / 2;
+  else if (align === 'right') cx = x - total;
+  let i = 0;
+  for (const ch of txt) { ctx.fillText(ch, cx, y); cx += widths[i++]; }
+  ctx.restore();
+}
+
+function drawTitle() {
+  ctx.fillStyle = 'rgba(13,15,14,0.45)';
+  ctx.fillRect(0, 0, W, H);
+  smallCaps('THE GLASS TIDE', W / 2, H * 0.34, Math.min(54, W * 0.07));
+  ctx.fillStyle = 'rgba(233,229,218,0.6)';
+  ctx.font = '300 15px "Helvetica Neue", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  const narrow = W < 620;
+  if (!narrow) ctx.fillText('walk the strand · when the inner light rises, crouch in cover', W / 2, H * 0.34 + 44);
+  else {
+    ctx.fillText('walk the strand', W / 2, H * 0.34 + 40);
+    ctx.fillText('when the inner light rises, crouch in cover', W / 2, H * 0.34 + 60);
+  }
+  ctx.fillStyle = 'rgba(233,229,218,0.42)';
+  ctx.font = (narrow ? '11px' : '13px') + ' ui-monospace, Menlo, monospace';
+  if (!narrow) {
+    ctx.fillText('A / D or arrows - walk        S - crouch        M - sound', W / 2, H * 0.34 + 82);
+    ctx.fillText('touch: hold a side to walk, hold low center to crouch', W / 2, H * 0.34 + 104);
+  } else {
+    ctx.fillText('hold a side - walk', W / 2, H * 0.34 + 86);
+    ctx.fillText('hold low center - crouch', W / 2, H * 0.34 + 104);
+  }
+  const pulse = 0.5 + 0.35 * Math.sin(time * 2.2);
+  smallCaps(('ontouchstart' in window) ? 'TAP TO WALK' : 'PRESS ANY KEY', W / 2, H * 0.62, 17, pulse);
+  if (bestM > 0) {
+    ctx.fillStyle = 'rgba(233,229,218,0.35)';
+    ctx.font = '12px ui-monospace, Menlo, monospace';
+    ctx.fillText('furthest walk  ' + bestM + ' m   ·   witnessed  ' + witnessedTotal, W / 2, H * 0.62 + 40);
+  }
+}
+
+function drawHUD() {
+  const m = Math.floor(playerX / PX_PER_M);
+  ctx.save();
+  ctx.fillStyle = 'rgba(233,229,218,0.55)';
+  ctx.font = '12px ui-monospace, Menlo, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(m + ' m', 24, 34);
+  if (witnessedRun > 0) ctx.fillText('witnessed ' + witnessedRun, 24, 54);
+  ctx.textAlign = 'right';
+  ctx.fillText('best ' + bestM + ' m', W - 24, 34);
+  ctx.restore();
+}
+
+function drawDead() {
+  fadeWhite = Math.min(0.92, fadeWhite + 0.012);
+  ctx.fillStyle = 'rgba(233,231,224,' + fadeWhite + ')';
+  ctx.fillRect(0, 0, W, H);
+  if (fadeWhite > 0.85) {
+    ctx.fillStyle = 'rgba(20,22,21,0.85)';
+    smallCapsColored(deadMsg.toUpperCase(), W / 2, H * 0.42, Math.min(30, W * 0.045), 'rgba(20,22,21,0.85)');
+    const m = Math.floor(playerX / PX_PER_M);
+    ctx.fillStyle = 'rgba(20,22,21,0.6)';
+    ctx.font = '13px ui-monospace, Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(m + ' m walked   ·   ' + witnessedRun + ' witnessed   ·   best ' + bestM + ' m', W / 2, H * 0.42 + 44);
+    if (deadAge > 1.2) smallCapsColored('WALK AGAIN', W / 2, H * 0.6, 15, 'rgba(20,22,21,' + (0.4 + 0.3 * Math.sin(time * 2.2)) + ')');
+  }
+}
+function smallCapsColored(txt, x, y, size, color) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.font = '300 ' + size + 'px "Helvetica Neue", Arial, sans-serif';
+  const sp = size * 0.3;
+  let total = 0; const widths = [];
+  for (const ch of txt) { const w = ctx.measureText(ch).width + sp; widths.push(w); total += w; }
+  let cx = x - total / 2; let i = 0;
+  for (const ch of txt) { ctx.fillText(ch, cx, y); cx += widths[i++]; }
+  ctx.restore();
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+let holdUpdates = false;
+function frame(now) {
+  if (pendingShot) { const f = pendingShot; pendingShot = null; try { f(); } catch(e){ document.title = 'ERR:' + e.message; } }
+  let dt = (now - last) / 1000; last = now;
+  dt = Math.min(dt, 0.05);
+  if (holdUpdates) dt = 0;
+  time += dt;
+
+  if (state === 'play') {
+    updatePlayer(dt);
+    updateCreatures(dt);
+    dread = Math.max(0, dread - dt * 0.2);
+    if (dread >= 1) die();
+  } else if (state === 'dead') {
+    deadAge += dt;
+    updateCreatures(dt * 0.3);
+  } else {
+    // title idle: gentle world drift
+    camX = Math.sin(time * 0.05) * 100;
+    if (creatures.length === 0 && time > 2) spawnCreature();
+    updateCreatures(dt * 0.5);
+  }
+
+  drawSky();
+  drawSea();
+  // creatures sit between sea and shore
+  for (const c of creatures) drawCreature(c);
+  drawSand();
+  // redraw foam over sand edge
+  ctx.fillStyle = 'rgba(235,240,240,0.10)';
+  ctx.fillRect(0, waterY(), W, 3);
+  for (const z of coverZones(camX - 600, camX + W + 600)) drawCover(z);
+  if (state !== 'title') drawPlayer();
+  drawFog();
+  drawDread();
+
+  if (state === 'title') drawTitle();
+  else if (state === 'play') drawHUD();
+  else if (state === 'dead') drawDead();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---------- verification hooks (not gameplay) ---------- */
+window.onerror = function(m){ document.title = "ERR:" + m; };
+const qs = new URLSearchParams(location.search);
+let pendingShot = null;
+document.title = 'QS:' + qs.get('shot');
+if (qs.get('shot')) {
+  pendingShot = function() {
+    startRun();
+    if (qs.get('seq')) creatureSeq = parseInt(qs.get('seq'), 10);
+    if (qs.get('shot') === 'gaze') {
+      spawnCreature();
+      const c = creatures[0];
+      c.x = 500; c.state = 'active'; c.rise = 1; c.phase = 'gaze'; c.phaseT = 1.2; c.glow = 0.9; c.sweep = 0.45;
+      playerX = 260;
+    } else if (qs.get('shot') === 'dead') {
+      spawnCreature();
+      const c = creatures[0];
+      c.x = 620; c.state = 'active'; c.rise = 1; c.phase = 'calm'; c.glow = 0.1;
+      playerX = 300 * PX_PER_M; dread = 1; die(); deadAge = 3; fadeWhite = 0.95;
+    } else if (qs.get('shot') === 'play') {
+      spawnCreature();
+      const c = creatures[0];
+      c.x = 620; c.state = 'active'; c.rise = 1; c.phase = 'warn'; c.glow = 0.4;
+      playerX = 300; keys['d'] = true;
+    }
+    const ff = parseFloat(qs.get('t') || '1200');
+    const steps = Math.floor(ff / 16);
+    for (let i = 0; i < steps; i++) {
+      time += 0.016;
+      updatePlayer(0.016);
+      updateCreatures(0.016);
+    }
+    keys['d'] = false;
+    drawSky(); drawSea();
+    for (const c of creatures) drawCreature(c);
+    drawSand();
+    for (const z of coverZones(camX - 600, camX + W + 600)) drawCover(z);
+    holdUpdates = true;
+    document.title = "FROZEN-OK";
+  };
+}
+</script>
+</body>
+</html>
